@@ -7,7 +7,7 @@ import {Inspector} from './inspector/inspector';
 import {CompletionItemWrapper, provideCompletion} from './services/completion';
 import {provideSemanticTokens} from './services/semanticTokens';
 import {provideReferences} from './services/reference';
-import {TextEdit} from 'vscode-languageserver-types/lib/esm/main';
+import {TextEdit} from 'vscode-languageserver-types';
 import {Location} from 'vscode-languageserver';
 import {getGlobalSettings, resetGlobalSettings} from './core/settings';
 import {formatFile} from './formatter/formatter';
@@ -519,3 +519,38 @@ s_connection.onRequest('angelScript/printGlobalScope', params => {
 s_connection.listen();
 
 s_inspector.registerDiagnosticsCallback(s_connection.sendDiagnostics);
+
+// On shutdown, we clear the diagnostics and reset the inspector.
+let _shutdownCalled: boolean = false;
+
+s_connection.onShutdown(() => {
+    if (_shutdownCalled) {
+        // Throw a JSON-RPC error response as per LSP spec.
+        throw new lsp.ResponseError(
+            lsp.ErrorCodes.InvalidRequest,
+            'Shutdown has already been called.'
+        );
+    }
+
+    s_inspector.registerDiagnosticsCallback(() => {
+        return;
+    });
+    s_documentMap.clear();
+    s_inspector.reset();
+    _shutdownCalled = true;
+    return undefined;
+});
+
+s_connection.onExit(() => { 
+    if (!_shutdownCalled) {
+        // We did not receive a shutdown request before exit.
+        // Clear the diagnostics to avoid leaving stale diagnostics in the client.
+        s_inspector.registerDiagnosticsCallback(() => {
+            return;
+        });
+        s_documentMap.clear();
+        s_inspector.reset();
+        process.exit(1);
+    }   
+    process.exit(0);
+});

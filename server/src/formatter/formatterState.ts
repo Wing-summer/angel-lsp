@@ -1,6 +1,6 @@
 import {Node_Script} from '../compiler_parser/nodeObject';
 import {Position} from 'vscode-languageserver';
-import {TextEdit} from 'vscode-languageserver-types/lib/esm/main';
+import {TextEdit} from 'vscode-languageserver-types';
 import {TokenObject} from '../compiler_tokenizer/tokenObject';
 import {getGlobalSettings} from '../core/settings';
 

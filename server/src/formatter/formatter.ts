@@ -48,7 +48,7 @@ import {
     voidParameter
 } from '../compiler_parser/nodeObject';
 import {FormatterState, isEditedWrapAt} from './formatterState';
-import {TextEdit} from 'vscode-languageserver-types/lib/esm/main';
+import {TextEdit} from 'vscode-languageserver-types';
 import {formatMoveToNonComment, formatMoveUntil, formatMoveUntilNodeStart, formatTargetBy} from './formatterDetail';
 import {TokenObject} from '../compiler_tokenizer/tokenObject';
 

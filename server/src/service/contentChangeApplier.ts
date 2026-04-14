@@ -1,5 +1,5 @@
 import * as lsp from 'vscode-languageserver/node';
-import * as assert from 'node:assert';
+import assert = require('node:assert');
 
 export function moveDiagnosticsByChanges(
     diagnosticList: lsp.Diagnostic[],
@@ -60,7 +60,9 @@ type MoveElement =
       };
 
 function moveElementsByChange(elementList: MoveElement[], change: lsp.TextDocumentContentChangeEvent) {
-    assert(lsp.TextDocumentContentChangeEvent.isIncremental(change));
+    if (lsp.TextDocumentContentChangeEvent.isIncremental(change) === false) {
+        return false;
+    }
 
     const changeRange = change.range;
     const changeText = countLineBreaksAndLength(change.text);
