@@ -8,6 +8,17 @@ This is a Language Server for Visual Studio Code that offers features to make An
 
 ![sample.png](https://raw.githubusercontent.com/sashi0034/angel-lsp/main/sample.png)
 
+# Modifications
+
+This is a forked version with significant enhancements and customizations. The main modifications from upstream include:
+
+1. **Deploy Patches** - Applied deployment for standalone executable file usage including Windows icon integration.
+
+2. **String Diagnostics Implementation** - Enhanced analyzer with comprehensive string literal validation and diagnostics, improving error detection for string-related issues in AngelScript code.
+
+3. **Numeric Range Checking** - Implemented robust numeric type conversion validation, including range checks for type conversions and constructor calls. Added extensive side-effect analysis for numeric operations to catch potential overflow and type mismatch issues.
+
+4. **Custom Preprocessor for WingHexExplorer2** - Developed specialized preprocessor functionality with extended directive support, conditional compilation enhancements, and custom macro handling tailored for WingHexExplorer2 integration. Includes comprehensive test coverage for preprocessor functionality.
 
 # Introduction
 
