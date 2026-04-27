@@ -32,7 +32,7 @@ function getParserDiagnostics(file: string | FileContentUnit) {
     }
 
     const rawTokens = tokenize(uri, content);
-    const preprocessedTokens = preprocessAfterTokenize(rawTokens, []);
+    const preprocessedTokens = preprocessAfterTokenize(rawTokens, [], false);
     parseAfterPreprocess(preprocessedTokens.preprocessedTokens);
 
     return diagnostic.endSession();

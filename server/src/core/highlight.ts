@@ -58,17 +58,18 @@ export const tokenHighlightList = [
 ];
 
 export enum TokenHighlightModifier {
-    Nothing,
-    Declaration, // For declarations of symbols.
-    Definition, // For definitions of symbols, for example, in header files.
-    Readonly, // For readonly variables and member fields (constants).
-    Static, // For class members (static members).
-    Deprecated, // For symbols that should no longer be used.
-    Abstract, // For types and member functions that are abstract.
-    Async, // For functions that are marked async.
-    Modification, // For variable references where the variable is assigned to.
-    Documentation, // For occurrences of symbols in documentation.
-    DefaultLibrary // For symbols that are part of the standard library.
+    Nothing = 0,
+    Declaration = 1 << 0, // For declarations of symbols.
+    Definition = 1 << 1, // For definitions of symbols, for example, in header files.
+    Readonly = 1 << 2, // For readonly variables and member fields (constants).
+    Static = 1 << 3, // For class members (static members).
+    Deprecated = 1 << 4, // For symbols that should no longer be used.
+    Abstract = 1 << 5, // For types and member functions that are abstract.
+    Async = 1 << 6, // For functions that are marked async.
+    Modification = 1 << 7, // For variable references where the variable is assigned to.
+    Documentation = 1 << 8, // For occurrences of symbols in documentation.
+    DefaultLibrary = 1 << 9, // For symbols that are part of the standard library.
+    Inactive = 1 << 10 // For tokens inside inactive preprocessor branches.
 }
 
 export const tokenHighlightModifierList = [
@@ -82,5 +83,6 @@ export const tokenHighlightModifierList = [
     'async',
     'modification',
     'documentation',
-    'defaultLibrary'
+    'defaultLibrary',
+    'inactive'
 ];

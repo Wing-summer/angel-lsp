@@ -23,6 +23,7 @@ interface LanguageServerSettings {
         builtinKeywords: boolean;
         snippets: boolean;
     };
+    excludeDirectiveProcessPatterns: string[];
     files: {
         angelScript: string[];
         exclude: string[];
@@ -56,6 +57,7 @@ const defaultSettings: LanguageServerSettings = {
         builtinKeywords: true,
         snippets: true
     },
+    excludeDirectiveProcessPatterns: [],
     files: {
         angelScript: ['*.as'],
         exclude: []

@@ -118,8 +118,16 @@ export class Inspector {
         record.rawTokens = tokenize(uri, content);
         profiler.mark('Tokenizer'.padEnd(profilerDescriptionLength));
 
+        const globalSettings = getGlobalSettings();
+        const ignoreDirectives =
+            globalSettings.excludeDirectiveProcessPatterns.find(pattern => new RegExp(pattern).test(uri)) !== undefined;
+
         // Run the preprocessor.
-        record.preprocessedOutput = preprocessAfterTokenize(record.rawTokens, getGlobalSettings().definedSymbols);
+        record.preprocessedOutput = preprocessAfterTokenize(
+            record.rawTokens,
+            globalSettings.definedSymbols,
+            ignoreDirectives
+        );
         profiler.mark('Preprocessor'.padEnd(profilerDescriptionLength));
 
         // Run the parser.

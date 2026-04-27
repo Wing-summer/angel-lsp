@@ -19,7 +19,7 @@ export enum TokenKind {
 
 interface HighlightInfo {
     tokenHighlight: TokenHighlight;
-    modifier: TokenHighlightModifier;
+    modifier: number;
 }
 
 const emptyLocation = TextLocation.createEmpty();
@@ -78,6 +78,10 @@ export abstract class TokenObject {
         } else {
             this._highlight = {tokenHighlight: tokenHighlight, modifier: modifier};
         }
+    }
+
+    public addHighlightModifier(modifier: TokenHighlightModifier) {
+        this._highlight.modifier |= modifier;
     }
 
     public get highlight(): Readonly<HighlightInfo> {

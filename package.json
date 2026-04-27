@@ -104,6 +104,14 @@
             }
         ],
         "configurationDefaults": {
+            "editor.semanticTokenColorCustomizations": {
+                "rules": {
+                    "builtin": "#00b0e0",
+                    "directive": "#ffe020",
+                    "metadata": "#bb55ff",
+                    "*.inactive": "#808080"
+                }
+            },
             "[angelscript]": {
                 "editor.formatOnType": true
             }
@@ -217,7 +225,7 @@
                     "default": [
                         "EDITOR_ONLY"
                     ],
-                    "description": "Symbols that are considered defined before preprocessing. These symbols are used when evaluating #if directives."
+                    "description": "Host-controlled preprocessor symbols available before preprocessing. Each entry may be either `NAME` or `NAME=value`, and the values are used when evaluating `#if` expressions."
                 },
                 "angelScript.files.angelScript": {
                     "scope": "window",

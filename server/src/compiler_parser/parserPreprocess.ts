@@ -1,9 +1,12 @@
-import {TokenKind, TokenObject, StringToken} from '../compiler_tokenizer/tokenObject';
+import {IdentifierToken, TokenKind, TokenObject, StringToken, ReservedToken} from '../compiler_tokenizer/tokenObject';
+import {tokenize} from '../compiler_tokenizer/tokenizer';
+import {areTokensJoinedBy} from '../compiler_tokenizer/tokenUtils';
 import {diagnostic} from '../core/diagnostic';
-import {TokenHighlight} from '../core/highlight';
+import {TokenHighlightModifier, TokenHighlight} from '../core/highlight';
 import {TokenRange} from '../compiler_tokenizer/tokenRange';
-import {TextLocation, TextPosition} from '../compiler_tokenizer/textLocation';
-import * as assert from 'node:assert';
+import {TextLocation} from '../compiler_tokenizer/textLocation';
+import {basename} from 'node:path';
+import {fileURLToPath} from 'node:url';
 
 /**
  * Output of `preprocessAfterTokenize`.
@@ -20,6 +23,17 @@ interface IntermediateOutput {
     readonly definedSymbols: Set<string>; // '#define SYMBOL'
 }
 
+type DirectiveValue = number | string;
+
+interface MacroDefinition {
+    readonly replacementTokens: TokenObject[];
+}
+
+const configuredMacroVirtualPath = 'angel-lsp://configured-preprocessor-symbol';
+const builtinLineMacroName = '__LINE__';
+const builtinSectionMacroName = '__SECTION__';
+const builtinSectionBaseMacroName = '__SECTION_BASE__';
+
 /**
  * Preprocess the token list before parsing.
  * For example, this removes comments, concatenates adjacent strings, and handles directives.
@@ -28,10 +42,11 @@ interface IntermediateOutput {
  */
 export function preprocessAfterTokenize(
     rawTokens: TokenObject[],
-    externalDefinedSymbols: string[]
+    externalDefinedSymbols: string[],
+    ingoreDirectives: boolean
 ): PreprocessedOutput {
     // Handle preprocessor directives.
-    const intermediateOutput = preprocessDirectives(rawTokens, externalDefinedSymbols);
+    const intermediateOutput = preprocessDirectives(rawTokens, externalDefinedSymbols, ingoreDirectives);
 
     // Concatenate adjacent string literals.
     const preprocessedTokens = intermediateOutput.preprocessedTokens;
@@ -68,15 +83,17 @@ export function preprocessAfterTokenize(
 type IfDirectiveBlock = {
     tag: '#if';
     start: TextLocation;
-    isActiveBlock: boolean;
-    hasActiveBranch: boolean;
-    hasElse: boolean;
+    parentActive: boolean;
+    currentBranchActive: boolean;
+    hasTakenBranch: boolean;
+    hasElseBranch: boolean;
 };
 
 interface DirectivePreprocessorContext {
     ifDirectiveBlockStack: IfDirectiveBlock[];
     isActiveBlock: boolean;
     intermediateOutput: IntermediateOutput;
+    macroDefinitions: Map<string, MacroDefinition>;
 }
 
 function getCurrentIfDirectiveBlock(context: DirectivePreprocessorContext): IfDirectiveBlock | undefined {
@@ -88,75 +105,35 @@ function getCurrentIfDirectiveBlock(context: DirectivePreprocessorContext): IfDi
 }
 
 function updateInactiveBlockStatus(context: DirectivePreprocessorContext) {
-    for (const block of context.ifDirectiveBlockStack) {
-        if (!block.isActiveBlock) {
-            context.isActiveBlock = false;
-            return;
-        }
-    }
-
-    context.isActiveBlock = true;
+    const currentIfDirectiveBlock = getCurrentIfDirectiveBlock(context);
+    context.isActiveBlock = currentIfDirectiveBlock?.currentBranchActive ?? true;
 }
 
-function getDirectiveBlockStart(directiveTokens: TokenObject[]): TextLocation {
-    const directiveTail = directiveTokens[directiveTokens.length - 1];
-    return (directiveTail.nextRaw ?? directiveTail).location;
+function markTokenAsInactive(token: TokenObject) {
+    token.addHighlightModifier(TokenHighlightModifier.Inactive);
 }
 
-function reportInactiveDirectiveBlockIfNeeded(
-    context: DirectivePreprocessorContext,
-    currentIfDirectiveBlock: IfDirectiveBlock,
-    end: TextPosition
-) {
-    if (!context.isActiveBlock) {
-        diagnostic.unnecessary(currentIfDirectiveBlock.start.withEnd(end), 'Inactive #if branch');
+function markTokensAsInactive(tokens: TokenObject[]) {
+    for (const token of tokens) {
+        markTokenAsInactive(token);
     }
 }
 
-function evaluateIfDirectiveCondition(
-    context: DirectivePreprocessorContext,
-    conditionToken: TokenObject
-): boolean | undefined {
-    switch (conditionToken.kind) {
-        case TokenKind.Identifier:
-            return context.intermediateOutput.definedSymbols.has(conditionToken.text);
-        case TokenKind.Number: {
-            assert(conditionToken.isNumberToken());
-            const value = conditionToken.getNumberValue();
-            return value === undefined ? undefined : value !== 0;
-        }
-        default:
-            return undefined;
-    }
-}
-
-function getIfDirectiveCondition(
-    context: DirectivePreprocessorContext,
-    directiveTokens: TokenObject[]
-): boolean | undefined {
-    const conditionToken = directiveTokens[2];
-    if (conditionToken === undefined) {
-        diagnostic.error(directiveTokens[1].location, 'Expected a identifier or number token.');
-        return undefined;
-    }
-
-    const condition = evaluateIfDirectiveCondition(context, conditionToken);
-    if (condition === undefined) {
-        diagnostic.error(conditionToken.location, 'Expected a identifier or number token.');
-    }
-
-    return condition;
-}
-
-function preprocessDirectives(rawTokens: TokenObject[], externalDefinedSymbols: string[]): IntermediateOutput {
+function preprocessDirectives(
+    rawTokens: TokenObject[],
+    externalDefinedSymbols: string[],
+    ignoreDirectives: boolean
+): IntermediateOutput {
+    const configuredMacros = createConfiguredMacroDefinitions(externalDefinedSymbols);
     const context: DirectivePreprocessorContext = {
         ifDirectiveBlockStack: [],
         isActiveBlock: true,
         intermediateOutput: {
             preprocessedTokens: [],
             includePathTokens: [],
-            definedSymbols: new Set(externalDefinedSymbols)
-        }
+            definedSymbols: configuredMacros.definedSymbols
+        },
+        macroDefinitions: configuredMacros.macroDefinitions
     };
 
     // Handle preprocessor directives that start with `#`.
@@ -169,11 +146,24 @@ function preprocessDirectives(rawTokens: TokenObject[], externalDefinedSymbols: 
                 // Handle the directive.
                 const directiveTokens = sliceTokenListBySameLine(rawTokens, i);
 
-                handleDirectiveTokens(context, directiveTokens);
+                if (ignoreDirectives) {
+                    markTokensAsInactive(directiveTokens);
+                    diagnostic.error(directiveTokens[0].location, 'Preprocessor directives are forbidden.');
+                } else {
+                    if (!context.isActiveBlock) {
+                        markTokensAsInactive(directiveTokens);
+                    }
+
+                    handleDirectiveTokens(context, directiveTokens);
+                }
 
                 i += directiveTokens.length - 1;
                 continue;
             }
+        }
+
+        if (!context.isActiveBlock) {
+            markTokenAsInactive(rawTokens[i]);
         }
 
         if (!rawTokens[i].isCommentToken() && context.isActiveBlock) {
@@ -181,28 +171,41 @@ function preprocessDirectives(rawTokens: TokenObject[], externalDefinedSymbols: 
         }
     }
 
+    while (context.ifDirectiveBlockStack.length > 0) {
+        const unterminatedBlock = context.ifDirectiveBlockStack.pop()!;
+        diagnostic.error(unterminatedBlock.start, 'Missing `#endif` for conditional preprocessor block.');
+    }
+
     return context.intermediateOutput;
 }
 
-function handleDirectiveTokens(context: DirectivePreprocessorContext, directiveTokens: TokenObject[]) {
+function handleDirectiveTokens(context: DirectivePreprocessorContext, directiveTokens: TokenObject[]): void {
     const directiveHighlight = TokenHighlight.Macro;
     directiveTokens[0].setHighlight(directiveHighlight); // '#'
     if (directiveTokens.length === 1) {
+        diagnostic.error(directiveTokens[0].location, 'Expected a preprocessor directive name after `#`.');
         return;
     }
 
-    if (directiveTokens[1].text === 'include') {
-        // e.g., #include "filename"
-        directiveTokens[1].setHighlight(directiveHighlight);
+    const directiveNameToken = directiveTokens[1] as TokenObject;
+    directiveNameToken.setHighlight(directiveHighlight);
+    const isDirectiveNameToken =
+        directiveNameToken.kind === TokenKind.Identifier || directiveNameToken.kind === TokenKind.Reserved;
+    if (!isDirectiveNameToken) {
+        diagnostic.error(
+            directiveNameToken.location,
+            'Expected an identifier-like token as the preprocessor directive name.'
+        );
+        return;
+    }
 
-        if (!context.isActiveBlock) {
-            return;
-        }
+    if (directiveNameToken.text === 'include') {
+        // e.g., #include "filename"
 
         // Validate the include directive.
         const fileName = directiveTokens[2];
         if (fileName === undefined) {
-            diagnostic.error(directiveTokens[1].location, 'Expected a file name in the include directive.');
+            diagnostic.error(directiveNameToken.location, 'Expected a file name in the include directive.');
             return;
         }
 
@@ -212,130 +215,861 @@ function handleDirectiveTokens(context: DirectivePreprocessorContext, directiveT
         }
 
         context.intermediateOutput.includePathTokens.push(fileName);
-    } else if (directiveTokens[1].text === 'define') {
-        // e.g., #define SYMBOL_NAME
-        directiveTokens[1].setHighlight(directiveHighlight);
-
-        if (!context.isActiveBlock) {
-            return;
-        }
-
-        const symbolName = directiveTokens[2];
-        if (symbolName === undefined) {
-            diagnostic.error(directiveTokens[1].location, 'Expected a symbol name in the define directive.');
-            return;
-        }
-
-        if (!symbolName.isIdentifierToken()) {
-            diagnostic.error(directiveTokens[2].location, 'Expected a identifier token.');
-            return;
-        }
-
-        context.intermediateOutput.definedSymbols.add(directiveTokens[2].text);
-    } else if (directiveTokens[1].text === 'if') {
-        // e.g., #if SYMBOL_NAME, #if 1
-        directiveTokens[1].setHighlight(directiveHighlight);
-
-        const condition = getIfDirectiveCondition(context, directiveTokens);
-        if (condition === undefined) {
-            return;
-        }
-
+    } else if (directiveNameToken.text === 'define' || directiveNameToken.text === 'undef') {
+        diagnostic.error(
+            directiveNameToken.location,
+            `#${directiveNameToken.text} is not allowed in script files; preprocessor symbols are controlled by the host.`
+        );
+    } else if (
+        directiveNameToken.text === 'if' ||
+        directiveNameToken.text === 'ifdef' ||
+        directiveNameToken.text === 'ifndef'
+    ) {
+        const parentActive = context.isActiveBlock;
+        const conditionResult = parentActive ? evaluateConditionalDirectiveExpression(context, directiveTokens) : false;
+        const directiveTail = directiveTokens[directiveTokens.length - 1];
         context.ifDirectiveBlockStack.push({
             tag: '#if',
-            start: getDirectiveBlockStart(directiveTokens),
-            isActiveBlock: condition,
-            hasActiveBranch: condition,
-            hasElse: false
+            start: (directiveTail.nextRaw ?? directiveTail).location,
+            parentActive: parentActive,
+            currentBranchActive: parentActive && conditionResult,
+            hasTakenBranch: parentActive && conditionResult,
+            hasElseBranch: false
         });
 
         updateInactiveBlockStatus(context);
-    } else if (directiveTokens[1].text === 'elif') {
-        // e.g., #elif SYMBOL_NAME, #elif 1
-        directiveTokens[1].setHighlight(directiveHighlight);
-
+    } else if (directiveNameToken.text === 'elif') {
         const currentIfDirectiveBlock = getCurrentIfDirectiveBlock(context);
         if (!currentIfDirectiveBlock) {
-            diagnostic.error(directiveTokens[1].location, 'Missing `#if`');
+            diagnostic.error(directiveNameToken.location, 'Missing `#if`');
             return;
         }
 
-        if (currentIfDirectiveBlock.hasElse) {
-            diagnostic.error(directiveTokens[1].location, '`#elif` cannot appear after `#else`.');
+        if (currentIfDirectiveBlock.hasElseBranch) {
+            diagnostic.error(directiveNameToken.location, 'Unexpected `#elif` after `#else`.');
             return;
         }
 
-        reportInactiveDirectiveBlockIfNeeded(
-            context,
-            currentIfDirectiveBlock,
-            (directiveTokens[0].prevRaw ?? directiveTokens[0]).location.end
-        );
-
-        const condition = getIfDirectiveCondition(context, directiveTokens);
-        currentIfDirectiveBlock.start = getDirectiveBlockStart(directiveTokens);
-        if (condition === undefined) {
-            currentIfDirectiveBlock.isActiveBlock = false;
-            updateInactiveBlockStatus(context);
-            return;
-        }
-
-        currentIfDirectiveBlock.isActiveBlock = !currentIfDirectiveBlock.hasActiveBranch && condition;
-        currentIfDirectiveBlock.hasActiveBranch =
-            currentIfDirectiveBlock.hasActiveBranch || currentIfDirectiveBlock.isActiveBlock;
+        const shouldEvaluateCondition = currentIfDirectiveBlock.parentActive && !currentIfDirectiveBlock.hasTakenBranch;
+        const conditionResult = shouldEvaluateCondition
+            ? evaluateConditionalDirectiveExpression(context, directiveTokens)
+            : false;
+        currentIfDirectiveBlock.currentBranchActive = conditionResult;
+        currentIfDirectiveBlock.hasTakenBranch = currentIfDirectiveBlock.hasTakenBranch || conditionResult;
 
         updateInactiveBlockStatus(context);
-    } else if (directiveTokens[1].text === 'else') {
-        // e.g., #else
-        directiveTokens[1].setHighlight(directiveHighlight);
+    } else if (directiveNameToken.text === 'else') {
+        if (!ensureDirectiveHasNoTrailingTokens(directiveTokens, 2, '#else')) {
+            return;
+        }
 
         const currentIfDirectiveBlock = getCurrentIfDirectiveBlock(context);
         if (!currentIfDirectiveBlock) {
-            diagnostic.error(directiveTokens[1].location, 'Missing `#if`');
+            diagnostic.error(directiveNameToken.location, 'Missing `#if`');
             return;
         }
 
-        if (currentIfDirectiveBlock.hasElse) {
-            diagnostic.error(directiveTokens[1].location, 'Duplicate `#else`.');
+        if (currentIfDirectiveBlock.hasElseBranch) {
+            diagnostic.error(directiveNameToken.location, 'Duplicate `#else`.');
             return;
         }
 
-        reportInactiveDirectiveBlockIfNeeded(
-            context,
-            currentIfDirectiveBlock,
-            (directiveTokens[0].prevRaw ?? directiveTokens[0]).location.end
-        );
-
-        currentIfDirectiveBlock.start = getDirectiveBlockStart(directiveTokens);
-        currentIfDirectiveBlock.isActiveBlock = !currentIfDirectiveBlock.hasActiveBranch;
-        currentIfDirectiveBlock.hasActiveBranch =
-            currentIfDirectiveBlock.hasActiveBranch || currentIfDirectiveBlock.isActiveBlock;
-        currentIfDirectiveBlock.hasElse = true;
+        currentIfDirectiveBlock.hasElseBranch = true;
+        currentIfDirectiveBlock.currentBranchActive =
+            currentIfDirectiveBlock.parentActive && !currentIfDirectiveBlock.hasTakenBranch;
+        currentIfDirectiveBlock.hasTakenBranch = true;
 
         updateInactiveBlockStatus(context);
-    } else if (directiveTokens[1].text === 'endif') {
-        // e.g., #endif
-        directiveTokens[1].setHighlight(directiveHighlight);
-
-        const currentIfDirectiveBlock = getCurrentIfDirectiveBlock(context);
-        if (!currentIfDirectiveBlock) {
-            diagnostic.error(directiveTokens[1].location, 'Missing `#if`');
+    } else if (directiveNameToken.text === 'endif') {
+        if (!ensureDirectiveHasNoTrailingTokens(directiveTokens, 2, '#endif')) {
             return;
         }
 
-        reportInactiveDirectiveBlockIfNeeded(
-            context,
-            currentIfDirectiveBlock,
-            (directiveTokens[0].prevRaw ?? directiveTokens[0]).location.end
-        );
+        const currentIfDirectiveBlock = getCurrentIfDirectiveBlock(context);
+        if (!currentIfDirectiveBlock) {
+            diagnostic.error(directiveNameToken.location, 'Missing `#if`');
+            return;
+        }
 
         context.ifDirectiveBlockStack.pop();
-
         updateInactiveBlockStatus(context);
+    } else if (directiveNameToken.text === 'pragma') {
+        for (let i = 2; i < directiveTokens.length; i++) {
+            directiveTokens[i].setHighlight(directiveHighlight);
+        }
     } else {
-        if (directiveTokens[1] != null) {
-            directiveTokens[1].setHighlight(TokenHighlight.Label);
+        diagnostic.error(
+            (directiveNameToken as TokenObject).location,
+            `Unsupported preprocessor directive: #${directiveNameToken.text}`
+        );
+    }
+}
+
+function evaluateConditionalDirectiveExpression(
+    context: DirectivePreprocessorContext,
+    directiveTokens: TokenObject[]
+): boolean {
+    const directiveName = directiveTokens[1]?.text;
+    const expressionTokens = sanitizeDirectivePayloadTokens(directiveTokens.slice(2));
+
+    if (directiveName === 'ifdef' || directiveName === 'ifndef') {
+        const symbolName = expressionTokens[0];
+        if (symbolName === undefined) {
+            diagnostic.error(directiveTokens[1].location, `Expected a symbol name in the ${directiveName} directive.`);
+            return false;
+        }
+
+        if (expressionTokens.length > 1) {
+            diagnostic.error(expressionTokens[1].location, `${directiveName} only accepts a single symbol name.`);
+            return false;
+        }
+
+        if (!symbolName.isIdentifierToken()) {
+            diagnostic.error((symbolName as TokenObject).location, 'Expected an identifier token.');
+            return false;
+        }
+
+        const isDefined = context.intermediateOutput.definedSymbols.has(symbolName.text);
+        return directiveName === 'ifdef' ? isDefined : !isDefined;
+    }
+
+    if (expressionTokens.length === 0) {
+        diagnostic.error(directiveTokens[1].location, 'Expected an expression in the #if directive.');
+        return false;
+    }
+
+    const standaloneEmptyMacro = getStandaloneEmptyMacro(context, expressionTokens);
+    if (standaloneEmptyMacro !== undefined) {
+        return context.intermediateOutput.definedSymbols.has(standaloneEmptyMacro.text);
+    }
+
+    const invalidEmptyMacro = findInvalidEmptyMacroUsage(context, expressionTokens);
+    if (invalidEmptyMacro !== undefined) {
+        diagnostic.error(
+            invalidEmptyMacro.location,
+            `Valueless macro \`${invalidEmptyMacro.text}\` can only be used alone in #if/#elif; use #ifdef/#ifndef instead.`
+        );
+        return false;
+    }
+
+    const expandedExpressionTokens = expandDirectiveExpressionTokens(context, expressionTokens);
+    if (expandedExpressionTokens.length === 0) {
+        diagnostic.error(directiveTokens[1].location, 'Expected an expression in the #if directive.');
+        return false;
+    }
+
+    const parser = new DirectiveExpressionParser(context, expandedExpressionTokens);
+    const value = parser.parseExpression();
+    if (!parser.isAtEnd()) {
+        diagnostic.error(parser.currentTokenLocation(), 'Unexpected token in preprocessor expression.');
+        return false;
+    }
+
+    if (typeof value === 'string') {
+        diagnostic.error(
+            expressionTokens[0]?.location ?? directiveTokens[1].location,
+            '#if expression must evaluate to a numeric or boolean value, not a string.'
+        );
+        return false;
+    }
+
+    return isTruthyValue(value);
+}
+
+class DirectiveExpressionParser {
+    private cursor = 0;
+
+    public constructor(
+        private readonly context: DirectivePreprocessorContext,
+        private readonly tokens: TokenObject[],
+        private readonly expansionStack: Set<string> = new Set(),
+        private readonly diagnosticFallbackLocation?: TextLocation
+    ) {}
+
+    public parseExpression(): DirectiveValue {
+        return this.parseLogicalOr();
+    }
+
+    public isAtEnd(): boolean {
+        return this.cursor >= this.tokens.length;
+    }
+
+    public currentToken(): TokenObject | undefined {
+        return this.tokens[this.cursor];
+    }
+
+    public currentTokenLocation(): TextLocation {
+        const token = this.currentToken();
+        if (token === undefined) {
+            return this.diagnosticFallbackLocation ?? TextLocation.createEmpty();
+        }
+
+        return this.getTokenLocation(token);
+    }
+
+    private parseLogicalOr(): DirectiveValue {
+        let value = this.parseLogicalAnd();
+        for (;;) {
+            const operator = this.match('||');
+            if (!operator) {
+                return value;
+            }
+
+            value = isTruthyValue(value) || isTruthyValue(this.parseLogicalAnd()) ? 1 : 0;
         }
     }
+
+    private parseLogicalAnd(): DirectiveValue {
+        let value = this.parseBitwiseOr();
+        for (;;) {
+            const operator = this.match('&&');
+            if (!operator) {
+                return value;
+            }
+
+            value = isTruthyValue(value) && isTruthyValue(this.parseBitwiseOr()) ? 1 : 0;
+        }
+    }
+
+    private parseBitwiseOr(): DirectiveValue {
+        let value = this.parseBitwiseXor();
+        for (;;) {
+            const operator = this.match('|');
+            if (!operator) {
+                return value;
+            }
+
+            value =
+                this.requireNumericValue(value, operator) | this.requireNumericValue(this.parseBitwiseXor(), operator);
+        }
+    }
+
+    private parseBitwiseXor(): DirectiveValue {
+        let value = this.parseBitwiseAnd();
+        for (;;) {
+            const operator = this.match('^');
+            if (!operator) {
+                return value;
+            }
+
+            value =
+                this.requireNumericValue(value, operator) ^ this.requireNumericValue(this.parseBitwiseAnd(), operator);
+        }
+    }
+
+    private parseBitwiseAnd(): DirectiveValue {
+        let value = this.parseEquality();
+        for (;;) {
+            const operator = this.match('&');
+            if (!operator) {
+                return value;
+            }
+
+            value =
+                this.requireNumericValue(value, operator) & this.requireNumericValue(this.parseEquality(), operator);
+        }
+    }
+
+    private parseEquality(): DirectiveValue {
+        let value = this.parseRelational();
+        for (;;) {
+            const equalsOperator = this.match('==');
+            if (equalsOperator) {
+                const rhs = this.parseRelational();
+                value = this.compareValues(value, rhs, equalsOperator) === 0 ? 1 : 0;
+                continue;
+            }
+
+            const notEqualsOperator = this.match('!=');
+            if (notEqualsOperator) {
+                const rhs = this.parseRelational();
+                value = this.compareValues(value, rhs, notEqualsOperator) !== 0 ? 1 : 0;
+                continue;
+            }
+
+            return value;
+        }
+    }
+
+    private parseRelational(): DirectiveValue {
+        let value = this.parseShift();
+        for (;;) {
+            const lessThanOperator = this.match('<');
+            if (lessThanOperator) {
+                value = this.compareValues(value, this.parseShift(), lessThanOperator) < 0 ? 1 : 0;
+                continue;
+            }
+
+            const lessOrEqualOperator = this.match('<=');
+            if (lessOrEqualOperator) {
+                value = this.compareValues(value, this.parseShift(), lessOrEqualOperator) <= 0 ? 1 : 0;
+                continue;
+            }
+
+            const greaterThanOperator = this.match('>');
+            if (greaterThanOperator) {
+                value = this.compareValues(value, this.parseShift(), greaterThanOperator) > 0 ? 1 : 0;
+                continue;
+            }
+
+            const greaterOrEqualOperator = this.match('>=');
+            if (greaterOrEqualOperator) {
+                value = this.compareValues(value, this.parseShift(), greaterOrEqualOperator) >= 0 ? 1 : 0;
+                continue;
+            }
+
+            return value;
+        }
+    }
+
+    private parseShift(): DirectiveValue {
+        let value = this.parseAdditive();
+        for (;;) {
+            const shiftLeftOperator = this.match('<<');
+            if (shiftLeftOperator) {
+                value =
+                    this.requireNumericValue(value, shiftLeftOperator) <<
+                    this.requireNumericValue(this.parseAdditive(), shiftLeftOperator);
+                continue;
+            }
+
+            const shiftRightOperator = this.match('>>');
+            if (shiftRightOperator) {
+                value =
+                    this.requireNumericValue(value, shiftRightOperator) >>
+                    this.requireNumericValue(this.parseAdditive(), shiftRightOperator);
+                continue;
+            }
+
+            const unsignedShiftRightOperator = this.match('>>>');
+            if (unsignedShiftRightOperator) {
+                value =
+                    this.requireNumericValue(value, unsignedShiftRightOperator) >>>
+                    this.requireNumericValue(this.parseAdditive(), unsignedShiftRightOperator);
+                continue;
+            }
+
+            return value;
+        }
+    }
+
+    private parseAdditive(): DirectiveValue {
+        let value = this.parseMultiplicative();
+        for (;;) {
+            const plusOperator = this.match('+');
+            if (plusOperator) {
+                const rhs = this.parseMultiplicative();
+                value =
+                    typeof value === 'string' || typeof rhs === 'string' ? String(value) + String(rhs) : value + rhs;
+                continue;
+            }
+
+            const minusOperator = this.match('-');
+            if (minusOperator) {
+                value =
+                    this.requireNumericValue(value, minusOperator) -
+                    this.requireNumericValue(this.parseMultiplicative(), minusOperator);
+                continue;
+            }
+
+            return value;
+        }
+    }
+
+    private parseMultiplicative(): DirectiveValue {
+        let value = this.parseUnary();
+        for (;;) {
+            const multiplyOperator = this.match('*');
+            if (multiplyOperator) {
+                value =
+                    this.requireNumericValue(value, multiplyOperator) *
+                    this.requireNumericValue(this.parseUnary(), multiplyOperator);
+                continue;
+            }
+
+            const divideOperator = this.match('/');
+            if (divideOperator) {
+                const rhs = this.requireNumericValue(this.parseUnary(), divideOperator);
+                if (rhs === 0) {
+                    diagnostic.error(
+                        this.getTokenLocation(divideOperator),
+                        'Division by zero in preprocessor expression.'
+                    );
+                    value = 0;
+                    continue;
+                }
+
+                value = Math.trunc(this.requireNumericValue(value, divideOperator) / rhs);
+                continue;
+            }
+
+            const moduloOperator = this.match('%');
+            if (moduloOperator) {
+                const rhs = this.requireNumericValue(this.parseUnary(), moduloOperator);
+                if (rhs === 0) {
+                    diagnostic.error(
+                        this.getTokenLocation(moduloOperator),
+                        'Modulo by zero in preprocessor expression.'
+                    );
+                    value = 0;
+                    continue;
+                }
+
+                value = this.requireNumericValue(value, moduloOperator) % rhs;
+                continue;
+            }
+
+            return value;
+        }
+    }
+
+    private parseUnary(): DirectiveValue {
+        const logicalNotOperator = this.match('!');
+        if (logicalNotOperator) {
+            return isTruthyValue(this.parseUnary()) ? 0 : 1;
+        }
+
+        const unaryPlusOperator = this.match('+');
+        if (unaryPlusOperator) {
+            return this.requireNumericValue(this.parseUnary(), unaryPlusOperator);
+        }
+
+        const unaryMinusOperator = this.match('-');
+        if (unaryMinusOperator) {
+            return -this.requireNumericValue(this.parseUnary(), unaryMinusOperator);
+        }
+
+        const bitwiseNotOperator = this.match('~');
+        if (bitwiseNotOperator) {
+            return ~this.requireNumericValue(this.parseUnary(), bitwiseNotOperator);
+        }
+
+        return this.parsePrimary();
+    }
+
+    private parsePrimary(): DirectiveValue {
+        const token = this.currentToken();
+        if (token === undefined) {
+            diagnostic.error(this.currentTokenLocation(), 'Expected a value in preprocessor expression.');
+            return 0;
+        }
+
+        const tokenText = token.text;
+
+        const openParen = this.match('(');
+        if (openParen) {
+            const value = this.parseExpression();
+            if (!this.match(')')) {
+                diagnostic.error(this.getTokenLocation(openParen), 'Expected `)` in preprocessor expression.');
+                return 0;
+            }
+
+            return value;
+        }
+
+        if (token.isNumberToken()) {
+            this.cursor++;
+            return parseDirectiveNumberLiteral(token.text);
+        }
+
+        if (token.isStringToken()) {
+            this.cursor++;
+            return token.getStringContent();
+        }
+
+        if (token.isIdentifierToken()) {
+            this.cursor++;
+            return this.resolveIdentifierValue(token);
+        }
+
+        if (tokenText === 'true' || tokenText === 'false') {
+            this.cursor++;
+            return tokenText === 'true' ? 1 : 0;
+        }
+
+        diagnostic.error((token as TokenObject).location, 'Expected a valid token in preprocessor expression.');
+        this.cursor++;
+        return 0;
+    }
+
+    private resolveIdentifierValue(token: TokenObject): DirectiveValue {
+        const builtinMacroValue = this.resolveBuiltinMacroValue(token);
+        if (builtinMacroValue !== undefined) {
+            return builtinMacroValue;
+        }
+
+        return 0;
+    }
+
+    private resolveBuiltinMacroValue(token: TokenObject): DirectiveValue | undefined {
+        const tokenLocation = this.getTokenLocation(token);
+        const sectionPath = normalizeSectionPath(tokenLocation.path);
+
+        if (token.text === builtinLineMacroName) {
+            return tokenLocation.start.line + 1;
+        }
+
+        if (token.text === builtinSectionMacroName) {
+            return sectionPath;
+        }
+
+        if (token.text === builtinSectionBaseMacroName) {
+            return basename(sectionPath);
+        }
+
+        return undefined;
+    }
+
+    private compareValues(lhs: DirectiveValue, rhs: DirectiveValue, operatorToken?: TokenObject): number {
+        if (typeof lhs === 'string' && typeof rhs === 'string') {
+            // Allow string-to-string comparison
+            if (lhs < rhs) {
+                return -1;
+            }
+
+            if (lhs > rhs) {
+                return 1;
+            }
+
+            return 0;
+        }
+
+        if (typeof lhs === 'string' || typeof rhs === 'string') {
+            // Mixed string and numeric comparison is not allowed
+            diagnostic.error(
+                operatorToken ? this.getTokenLocation(operatorToken) : this.currentTokenLocation(),
+                'Cannot compare string and numeric values in preprocessor expressions.'
+            );
+            return -1;
+        }
+
+        if (lhs < rhs) {
+            return -1;
+        }
+
+        if (lhs > rhs) {
+            return 1;
+        }
+
+        return 0;
+    }
+
+    private requireNumericValue(value: DirectiveValue, operatorToken: TokenObject): number {
+        if (typeof value === 'string') {
+            diagnostic.error(
+                this.getTokenLocation(operatorToken),
+                `Operator \`${operatorToken.text}\` does not support string operands in preprocessor expressions.`
+            );
+            return 0;
+        }
+
+        return value;
+    }
+
+    private match(text: string): TokenObject | undefined {
+        const token = this.currentToken();
+        if (token?.text !== text) {
+            return undefined;
+        }
+
+        this.cursor++;
+        return token;
+    }
+
+    private getTokenLocation(token: TokenObject): TextLocation {
+        if (token.location.path === configuredMacroVirtualPath && this.diagnosticFallbackLocation !== undefined) {
+            return this.diagnosticFallbackLocation;
+        }
+
+        return token.location;
+    }
+}
+
+function parseDirectiveNumberLiteral(text: string): number {
+    const normalized = text.replace(/'/g, '').replace(/[uUlL]+$/g, '');
+    if (/^0[xX][0-9A-Fa-f]+$/.test(normalized)) {
+        return parseInt(normalized.slice(2), 16);
+    }
+
+    if (/^0[bB][01]+$/.test(normalized)) {
+        return parseInt(normalized.slice(2), 2);
+    }
+
+    if (/^0[oO][0-7]+$/.test(normalized)) {
+        return parseInt(normalized.slice(2), 8);
+    }
+
+    if (/^0[dD][0-9]+$/.test(normalized)) {
+        return parseInt(normalized.slice(2), 10);
+    }
+
+    const value = Number(normalized);
+    return Number.isFinite(value) ? Math.trunc(value) : 0;
+}
+
+function isTruthyValue(value: DirectiveValue): boolean {
+    return typeof value === 'string' ? value.length > 0 : value !== 0;
+}
+
+function createConfiguredMacroDefinitions(externalDefinedSymbols: string[]): {
+    definedSymbols: Set<string>;
+    macroDefinitions: Map<string, MacroDefinition>;
+} {
+    const definedSymbols = new Set<string>();
+    const macroDefinitions = new Map<string, MacroDefinition>();
+
+    for (const entry of externalDefinedSymbols) {
+        const definition = parseConfiguredMacroDefinition(entry);
+        if (definition === undefined) {
+            continue;
+        }
+
+        definedSymbols.add(definition.name);
+        macroDefinitions.set(definition.name, {
+            replacementTokens: definition.replacementTokens
+        });
+    }
+
+    return {definedSymbols, macroDefinitions};
+}
+
+function parseConfiguredMacroDefinition(entry: string): {name: string; replacementTokens: TokenObject[]} | undefined {
+    const trimmedEntry = entry.trim();
+    if (trimmedEntry === '') {
+        return undefined;
+    }
+
+    const separatorIndex = trimmedEntry.indexOf('=');
+    const name = (separatorIndex >= 0 ? trimmedEntry.slice(0, separatorIndex) : trimmedEntry).trim();
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) === false) {
+        return undefined;
+    }
+
+    const replacementText = separatorIndex >= 0 ? trimmedEntry.slice(separatorIndex + 1).trim() : '';
+    return {
+        name,
+        replacementTokens:
+            replacementText === ''
+                ? []
+                : sanitizeDirectivePayloadTokens(tokenize(configuredMacroVirtualPath, replacementText))
+    };
+}
+
+function sanitizeDirectivePayloadTokens(tokens: TokenObject[]): TokenObject[] {
+    return tokens.filter(token => !token.isCommentToken());
+}
+
+function getStandaloneEmptyMacro(
+    context: DirectivePreprocessorContext,
+    expressionTokens: TokenObject[]
+): TokenObject | undefined {
+    if (expressionTokens.length !== 1) {
+        return undefined;
+    }
+
+    const token = expressionTokens[0];
+    if (!token.isIdentifierToken()) {
+        return undefined;
+    }
+
+    const macroDefinition = context.macroDefinitions.get(token.text);
+    if (macroDefinition?.replacementTokens.length !== 0) {
+        return undefined;
+    }
+
+    return token;
+}
+
+function findInvalidEmptyMacroUsage(
+    context: DirectivePreprocessorContext,
+    expressionTokens: TokenObject[]
+): TokenObject | undefined {
+    for (const token of expressionTokens) {
+        if (!token.isIdentifierToken()) {
+            continue;
+        }
+
+        const macroDefinition = context.macroDefinitions.get(token.text);
+        if (macroDefinition?.replacementTokens.length === 0) {
+            return token;
+        }
+    }
+
+    return undefined;
+}
+
+function expandDirectiveExpressionTokens(
+    context: DirectivePreprocessorContext,
+    tokens: TokenObject[],
+    expansionStack: Set<string> = new Set(),
+    invocationToken?: TokenObject
+): TokenObject[] {
+    const result: TokenObject[] = [];
+
+    let i = 0;
+    while (i < tokens.length) {
+        const token = tokens[i];
+
+        // -----------------------------------------------
+        // Tokens that start with `>` need to be merged with the following token
+        // because tokenization splits them apart.
+        // >=, >>, >>> are affected.
+        const mergedToken = tryMergeGreaterThanToken(tokens, i);
+        if (mergedToken !== undefined) {
+            result.push(mergedToken.token);
+            i += mergedToken.consumedCount;
+            continue;
+        }
+
+        if (token.isIdentifierToken()) {
+            const isBuiltinMacro =
+                token.text === builtinLineMacroName ||
+                token.text === builtinSectionMacroName ||
+                token.text === builtinSectionBaseMacroName;
+            if (isBuiltinMacro) {
+                if (invocationToken !== undefined && token.location.path === configuredMacroVirtualPath) {
+                    result.push(new IdentifierToken(token.text, invocationToken.location));
+                } else {
+                    result.push(token);
+                }
+
+                i++;
+                continue;
+            }
+
+            const macroDefinition = context.macroDefinitions.get(token.text);
+            if (macroDefinition !== undefined) {
+                if (expansionStack.has(token.text)) {
+                    diagnostic.error(
+                        token.location,
+                        `Circular macro expansion for \`${token.text}\` in preprocessor expression.`
+                    );
+                    i++;
+                    continue;
+                }
+
+                if (macroDefinition.replacementTokens.length === 0) {
+                    i++;
+                    continue;
+                }
+
+                const nestedExpansionStack = new Set(expansionStack);
+                nestedExpansionStack.add(token.text);
+                result.push(
+                    ...expandDirectiveExpressionTokens(
+                        context,
+                        macroDefinition.replacementTokens,
+                        nestedExpansionStack,
+                        token
+                    )
+                );
+                i++;
+                continue;
+            }
+        }
+
+        result.push(token);
+        i++;
+    }
+
+    return result;
+}
+
+function tryMergeGreaterThanToken(
+    tokens: TokenObject[],
+    currentIndex: number
+): {token: ReservedToken; consumedCount: number} | undefined {
+    const currentToken = tokens[currentIndex];
+    if (currentToken.text !== '>') {
+        return undefined;
+    }
+
+    const nextToken = tokens[currentIndex + 1];
+    if (nextToken === undefined) {
+        return undefined;
+    }
+
+    // Helper function to check if tokens can be merged
+    const check = (
+        expected: string[],
+        combinedText: string
+    ): {token: ReservedToken; consumedCount: number} | undefined => {
+        // Check if the expected tokens are consecutive in the array
+        for (let j = 0; j < expected.length; j++) {
+            const token = tokens[currentIndex + 1 + j];
+            if (token === undefined || token.text !== expected[j]) {
+                return undefined;
+            }
+        }
+
+        // Check if they are on the same line and consecutive
+        const firstToken = tokens[currentIndex];
+        const lastToken = tokens[currentIndex + expected.length];
+        if (firstToken.location.start.line !== lastToken.location.start.line) {
+            return undefined;
+        }
+
+        let expectedColumn = firstToken.location.end.character;
+        for (let j = 1; j <= expected.length; j++) {
+            const token = tokens[currentIndex + j];
+            if (token.location.start.character !== expectedColumn) {
+                return undefined;
+            }
+
+            expectedColumn = token.location.end.character;
+        }
+
+        const coveredRange = new TokenRange(currentToken, tokens[currentIndex + expected.length]);
+        return {
+            token: ReservedToken.createVirtual(combinedText, coveredRange),
+            consumedCount: expected.length + 1
+        };
+    };
+
+    // '>=' (1 additional token)
+    let result = check(['='], '>=');
+    if (result !== undefined) {
+        return result;
+    }
+
+    // '>>>' (2 additional tokens)
+    result = check(['>', '>'], '>>>');
+    if (result !== undefined) {
+        return result;
+    }
+
+    // '>>' (1 additional token)
+    result = check(['>'], '>>');
+    if (result !== undefined) {
+        return result;
+    }
+
+    return undefined;
+}
+
+function normalizeSectionPath(path: string): string {
+    if (path.startsWith('file://')) {
+        try {
+            return fileURLToPath(path);
+        } catch {
+            return path;
+        }
+    }
+
+    return path;
+}
+
+function ensureDirectiveHasNoTrailingTokens(
+    directiveTokens: TokenObject[],
+    expectedLength: number,
+    directiveName: string
+): boolean {
+    if (directiveTokens.length <= expectedLength) {
+        return true;
+    }
+
+    diagnostic.error(directiveTokens[expectedLength].location, `${directiveName} does not accept trailing tokens.`);
+    return false;
 }
 
 function sliceTokenListBySameLine(tokens: TokenObject[], head: number): TokenObject[] {
