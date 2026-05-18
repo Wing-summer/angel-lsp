@@ -257,4 +257,56 @@ describe('analyzer/opCast', () => {
             }
         ]);
     });
+
+    it('accepts: void opCast(?&out) can cast dictionary values to array handles.', () => {
+        expectSuccess([
+            {
+                uri: 'file:///path/to/as.predefined',
+                content: `
+                class array<T> {}
+                class dictionaryValue {
+                    void opCast(?&out value);
+                }
+                class JsonData {
+                    dictionaryValue Value;
+                }
+                `
+            },
+            {
+                uri: 'file:///path/to/file.as',
+                content: `// dictionaryValue can be explicitly cast to array handles through opCast(?&out).
+                void main() {
+                    JsonData json;
+                    array<float>@ values = cast<array<float>@>(json.Value);
+                }
+                `
+            }
+        ]);
+    });
+
+    it('accepts: opCast return conversions can cast dictionary values to array handles.', () => {
+        expectSuccess([
+            {
+                uri: 'file:///path/to/as.predefined',
+                content: `
+                class array<T> {}
+                class dictionaryValue {
+                    array<float>@ opCast();
+                }
+                class JsonData {
+                    dictionaryValue Value;
+                }
+                `
+            },
+            {
+                uri: 'file:///path/to/file.as',
+                content: `// dictionaryValue can be explicitly cast to array handles through opCast return types.
+                void main() {
+                    JsonData json;
+                    array<float>@ values = cast<array<float>@>(json.Value);
+                }
+                `
+            }
+        ]);
+    });
 });

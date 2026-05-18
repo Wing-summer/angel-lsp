@@ -103,11 +103,6 @@ function evaluateTypeConversionInternal(
         }
     }
 
-    // Template arguments must be the same.
-    if (areTemplateArgumentsEqual(from, to) === false) {
-        return undefined;
-    }
-
     // Source or destination is a function type
     if (toTypeOrFunc.isFunction()) {
         if (!fromTypeOrFunc.isFunction()) {
@@ -382,16 +377,18 @@ function evaluateConvObjectToObject(
     assert(fromType.isPrimitiveOrEnum() === false && toType.isPrimitiveOrEnum() === false);
 
     // Check if these are identical
-    if (fromType.equals(toType)) {
-        return addObjectConstConversionCost({cost: ConversionCost.NoConv}, from, to);
-    }
+    if (areTemplateArgumentsEqual(from, to)) {
+        if (fromType.equals(toType)) {
+            return addObjectConstConversionCost({cost: ConversionCost.NoConv}, from, to);
+        }
 
-    if (mode === ConversionMode.ExplicitCast && from.handle !== undefined && to.handle !== undefined) {
-        return addObjectConstConversionCost({cost: ConversionCost.RefConv}, from, to);
-    }
+        if (mode === ConversionMode.ExplicitCast && from.handle !== undefined && to.handle !== undefined) {
+            return addObjectConstConversionCost({cost: ConversionCost.RefConv}, from, to);
+        }
 
-    if (canDownCast(fromType, toType)) {
-        return addObjectConstConversionCost({cost: ConversionCost.RefConv}, from, to);
+        if (canDownCast(fromType, toType)) {
+            return addObjectConstConversionCost({cost: ConversionCost.RefConv}, from, to);
+        }
     }
 
     // Check the conversion using a construct with a single parameter.
