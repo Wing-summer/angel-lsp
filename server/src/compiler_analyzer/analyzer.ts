@@ -1735,6 +1735,10 @@ function analyzeEnumMemberAccess(
         return undefined;
     } else if (enumCandidates.length == 1) {
         // Resolve the implicit enum member access.
+        getActiveGlobalScope().pushReference({
+            toSymbol: enumCandidates[0],
+            fromToken: varIdentifier
+        });
         return enumCandidates[0].type;
     }
     // enumCandidates.length >= 2
