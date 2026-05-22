@@ -1,7 +1,7 @@
 import {ResolvedType} from './resolvedType';
 import {getActiveGlobalScope, resolveActiveScope} from './symbolScope';
 import {TokenRange} from '../compiler_tokenizer/tokenRange';
-import {ConversionCost, ConversionEvaluation} from './typeConversion';
+import {ConversionCost, ConversionEvaluation, ConversionMode} from './typeConversion';
 import {VariableSymbol} from './symbolObject';
 import {analyzerDiagnostic} from './analyzerDiagnostic';
 import {stringifyResolvedType} from './symbolStringifier';
@@ -11,7 +11,8 @@ export function causeTypeConversionSideEffect(
     evaluation: ConversionEvaluation,
     from: ResolvedType | undefined,
     to: ResolvedType | undefined,
-    nodeRange?: TokenRange
+    nodeRange?: TokenRange,
+    mode?: ConversionMode
 ) {
     if (from === undefined) {
         return false;
@@ -74,12 +75,17 @@ export function causeTypeConversionSideEffect(
         return true;
     }
 
-    const shouldWarn = isRiskyConversionCost(evaluation.cost);
+    if (mode !== undefined && mode !== ConversionMode.Implicit && getSingleNumberLiteral(nodeRange) === undefined) {
+        return true;
+    }
+
+    const baseCost = getBaseConversionCost(evaluation.cost, from, to);
+    const shouldWarn = isRiskyConversionCost(baseCost, from, to);
     if (!shouldWarn) {
         return true;
     }
 
-    if (isCommonSafeLiteralConversion(evaluation, to.identifierText, nodeRange)) {
+    if (isCommonSafeLiteralConversion(baseCost, evaluation, to.identifierText, nodeRange)) {
         return true;
     }
 
@@ -149,7 +155,28 @@ function getOutOfRangeFloatLiteral(nodeRange: TokenRange, toinationType: string)
     return undefined;
 }
 
-function isRiskyConversionCost(cost: ConversionCost): boolean {
+function getBaseConversionCost(
+    cost: ConversionCost,
+    from: ResolvedType | undefined,
+    to: ResolvedType | undefined
+): ConversionCost {
+    const constCost =
+        from !== undefined && to !== undefined && from.isConst !== to.isConst
+            ? ConversionCost.ConstConv
+            : ConversionCost.NoConv;
+    const baseCost = cost - constCost;
+    return baseCost >= ConversionCost.NoConv ? (baseCost as ConversionCost) : cost;
+}
+
+function isRiskyConversionCost(
+    cost: ConversionCost,
+    from: ResolvedType | undefined,
+    to: ResolvedType | undefined
+): boolean {
+    if (cost === ConversionCost.UnsignedToSignedConv && isSafeUnsignedToSignedWiden(from, to)) {
+        return false;
+    }
+
     return (
         cost === ConversionCost.EnumDiffSizeConv ||
         cost === ConversionCost.PrimitiveSizeDownConv ||
@@ -160,7 +187,32 @@ function isRiskyConversionCost(cost: ConversionCost): boolean {
     );
 }
 
+function isSafeUnsignedToSignedWiden(from: ResolvedType | undefined, to: ResolvedType | undefined): boolean {
+    if (from === undefined || to === undefined) {
+        return false;
+    }
+
+    const fromType = from.typeOrFunc;
+    const toType = to.typeOrFunc;
+    if (!fromType.isType() || !toType.isType()) {
+        return false;
+    }
+
+    const fromText = fromType.identifierText;
+    const toText = toType.identifierText;
+    if (!fromText.startsWith('uint') || !toText.startsWith('int')) {
+        return false;
+    }
+
+    const fromRange = integerTypeRange.get(fromText);
+    const toRange = integerTypeRange.get(toText);
+    return (
+        fromRange !== undefined && toRange !== undefined && toRange.min <= fromRange.min && toRange.max >= fromRange.max
+    );
+}
+
 function isCommonSafeLiteralConversion(
+    baseCost: ConversionCost,
     evaluation: ConversionEvaluation,
     toinationType: string,
     nodeRange: TokenRange
@@ -170,7 +222,7 @@ function isCommonSafeLiteralConversion(
         return false;
     }
 
-    if (evaluation.cost === ConversionCost.IntToFloatConv) {
+    if (baseCost === ConversionCost.IntToFloatConv) {
         const intValue = parseIntegerLiteral(literal);
         if (intValue === undefined) {
             return false;
@@ -187,7 +239,7 @@ function isCommonSafeLiteralConversion(
         return false;
     }
 
-    if (evaluation.cost === ConversionCost.FloatToIntConv) {
+    if (baseCost === ConversionCost.FloatToIntConv) {
         const floatValue = parseFloatLiteral(literal);
         if (floatValue === undefined || Number.isInteger(floatValue) === false) {
             return false;

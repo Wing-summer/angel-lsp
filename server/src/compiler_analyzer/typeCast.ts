@@ -46,7 +46,7 @@ export function checkTypeCast(
         return false;
     }
 
-    causeTypeConversionSideEffect(evaluation, from, to, nodeRange);
+    causeTypeConversionSideEffect(evaluation, from, to, nodeRange, mode);
 
     return true;
 }
